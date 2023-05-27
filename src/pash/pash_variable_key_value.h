@@ -13,31 +13,44 @@
 
 #include "../../util/hash.h"
 #include "../../util/pair.h"
+#include "../../util/compound_pointer.h"
 #include "../Hash.h"
 
 #define INSERT_HTM
-// #define READ_HTM
-#define READ_RETRY_TIME 2
+// #define SPLIT_LOCK
+#define READ_HTM
+#define READ_RETRY_TIME 10
 
-// #define VALUE_LENGTH_VARIABLE
+#define VALUE_LENGTH_VARIABLE
 extern uint64_t value_length;
 
 #define INLOCK_UPDATE_RETRY_TIME 3
+#define FREQ 64
 
 extern __thread nsTimer *clk;
-
 extern uint64_t update_retry_time;
 extern uint64_t hot_num;
 extern uint64_t hot_bit;
 extern uint64_t asso;
 __thread uint64_t request = 0;
+extern uint64_t batch_size;
+
+extern __thread Key_t **candidateKeys;
+extern __thread Value_t **candidateValues;
+extern __thread void **candidateSegments;
+extern __thread int *candidateNum;
+extern __thread int **candidateSlotIdx;
+
+extern __thread int batch_valid;
+extern __thread int batch_invalid;
 
 namespace zhash {
-template <class T>
 struct _Pair {
-  T key;
+  Key_t key;
   Value_t value;
 };
+
+const Key_t INVAL = 0;
 
 // const size_t kCacheLineSize = 64;
 // constexpr size_t kSegmentBits = 8;
@@ -51,127 +64,6 @@ constexpr size_t kMetadataSpace = 0;
 
 constexpr size_t kNumBucket = 4;
 constexpr size_t kNumSlotPerBucket = 4;
-
-/* fingerprint and position in Key_c: 0-10 bits = fingerprint; 11 bit = valid; 12-15 bits = position; 16-63bits = Key */
-constexpr size_t kFingerprintBits = 11;
-constexpr size_t kValidBits = 1;
-constexpr size_t kPositionBits = 4;
-constexpr size_t kFingerprintShift = 64 - kFingerprintBits - 2; // not use the last two bits
-constexpr size_t kPositionShift = 64 - kFingerprintBits - kValidBits - kPositionBits;
-constexpr size_t kFingerprintMask = 0xffe0000000000000;
-constexpr size_t kValidMask = 0x0010000000000000;
-constexpr size_t kPositionMask = 0x000f000000000000;
-constexpr size_t kKeyMask = 0x0000ffffffffffff;
-
-inline uint64_t get_position(uint64_t key_c) {
-  return (key_c & kPositionMask) >> kPositionShift;
-}
-
-inline uint64_t get_position(void *key_c) {
-  return ((uint64_t)key_c & kPositionMask) >> kPositionShift;
-}
-
-inline void set_fingerprint_and_position(uint64_t *key_c, uint64_t hash, uint64_t position) {
-  uint64_t clear_key_c = *key_c & kKeyMask;
-  uint64_t fingerprint = (hash << kFingerprintShift) & kFingerprintMask;
-  position = (position << kPositionShift) & kPositionMask;
-  *key_c = clear_key_c | fingerprint | position | kValidMask;
-}
-
-inline void set_fingerprint_and_position(void **key_c, uint64_t hash, uint64_t position) {
-  uint64_t clear_key_c = (uint64_t)*key_c & kKeyMask;
-  uint64_t fingerprint = (hash << kFingerprintShift)  & kFingerprintMask;
-  position = (position << kPositionShift) & kPositionMask;
-  *key_c = (void *)(clear_key_c | fingerprint | position | kValidMask);
-}
-
-inline void clear_fingerprint_and_position(uint64_t *key_c) {
-  *key_c = *key_c & kKeyMask;
-}
-
-inline void clear_fingerprint_and_position(void **key_c) {
-  *key_c = (void *)((uint64_t)*key_c & kKeyMask);
-}
-
-inline bool check_fingerprint_and_position_valid(uint64_t key_c) {
-  uint64_t fp = key_c & kValidMask;
-  return (fp != 0);
-}
-
-inline bool check_fingerprint_and_position_valid(void *key_c) {
-  uint64_t fp = (uint64_t)key_c & kValidMask;
-  return (fp != 0);
-}
-
-inline bool match_fingerprint(uint64_t key_c, uint64_t hash) {
-  if (!check_fingerprint_and_position_valid(key_c))
-    return false;
-  return (key_c & kFingerprintMask) == ((hash << kFingerprintShift) & kFingerprintMask);
-}
-
-inline bool match_fingerprint(void *key_c, uint64_t hash) {
-  if (!check_fingerprint_and_position_valid(key_c))
-    return false;
-  return ((uint64_t)key_c & kFingerprintMask) == ((hash << kFingerprintShift) & kFingerprintMask);
-}
-
-inline bool match_key(uint64_t key_c, uint64_t key_compare) {
-  return (key_c & kKeyMask) == (key_compare & kKeyMask);
-}
-
-inline bool match_key(void* key_c, void* key_compare) {
-  return ((uint64_t)key_c & kKeyMask) == ((uint64_t)key_compare & kKeyMask);
-}
-
-inline uint64_t get_key(uint64_t key_c) {
-  return key_c & kKeyMask;
-}
-
-inline uint64_t get_key(void *key_c) {
-  return (uint64_t)key_c & kKeyMask;
-}
-
-inline void set_key(uint64_t *key_c, uint64_t key) {
-  uint64_t clear_key_c = *key_c & ~kKeyMask;
-  uint64_t clear_key = key & kKeyMask;
-  *key_c = clear_key_c | clear_key;
-}
-
-inline void set_key(void **key_c, void *key) {
-  uint64_t clear_key_c = (uint64_t)*key_c & ~kKeyMask;
-  uint64_t clear_key = (uint64_t)key & kKeyMask;
-  *key_c = (void *)(clear_key_c | clear_key);
-}
-
-inline void set_key(void **key_c, uint64_t key) {
-  uint64_t clear_key_c = (uint64_t)*key_c & ~kKeyMask;
-  uint64_t clear_key = key & kKeyMask;
-  *key_c = (void *)(clear_key_c | clear_key);
-}
-
-inline bool check_key_valid(uint64_t key_c) {
-  uint64_t key = key_c & kKeyMask;
-  return (key != 0);
-}
-
-inline bool check_key_valid(void *key_c) {
-  uint64_t key = (uint64_t)key_c & kKeyMask;
-  return (key != 0);
-}
-
-inline void clear_key(uint64_t *key_c) {
-  *key_c = (*key_c) & ~kKeyMask;
-}
-
-inline void clear_key(void **key_c) {
-  *key_c = (void *)((uint64_t)(*key_c) & ~kKeyMask);
-}
-
-// now only use "key" bits to compute hash of one key
-inline size_t h_key_bits(const void *key, size_t len, size_t seed = 0xc70697UL) {
-  uint64_t key_bits = get_key(*((uint64_t *)key));
-  return h(&key_bits, len, seed);
-}
 
 /* metadata in segment addr: 0-5 bits = local_depth; 6 bit = lock */
 constexpr size_t kDepthBits = 6;
@@ -215,10 +107,6 @@ inline void set_seg_lock_with_cas(void** seg_pp) {
       if (CAS(seg_pp, &old_value, new_value))
         break;
     }
-    // if (++time == 10000) {
-    //   assert(false);
-    //   return;
-    // }
     asm("pause");
   }
 }
@@ -238,37 +126,57 @@ inline bool var_compare(char *str1, char *str2, int len1, int len2) {
   if (len1 != len2) return false;
   return !memcmp(str1, str2, len1);
 }
+
+template <class T>
+inline bool match_key(Key_t slot_key, T input_key, uint64_t input_hash) {
+  if constexpr (std::is_pointer_v<T>) {
+    if (match_pointer_fp(slot_key, input_hash) &&
+        var_compare((char *)get_pointer_addr(slot_key), (char *)&(input_key->key), get_pointer_len(slot_key), input_key->length)) {
+        return true;
+    } else
+      return false;
+  } else {
+    return (slot_key == input_key);
+  }
+}
+
+template <class T>
+inline void set_key(Key_t *slot_key_p, T input_key, uint64_t input_hash, char *key_addr) {
+  if constexpr (std::is_pointer_v<T>) {
+    set_pointer_fp(slot_key_p, input_hash);
+    set_pointer_len_addr(slot_key_p, input_key->length, (uint64_t)key_addr);
+  } else {
+    *slot_key_p = input_key;
+  }
+}
+
+inline bool check_key_valid(Key_t slot_key) {
+  return (slot_key != INVAL);
+}
+
+inline void clear_key(Key_t *slot_key_p) {
+  *slot_key_p = INVAL;
+}
+
 template <class T>
 struct Seg_array;
 template <class T>
 struct Segment {
-  // static const size_t kNumSlot = kSegmentSize / sizeof(_Pair<T>);
-  static const size_t kNumSlot = kSegmentSize / sizeof(_Pair<T>) - kMetadataSpace;
+  static const size_t kNumSlot = kSegmentSize / sizeof(_Pair) - kMetadataSpace;
 
   Segment(void) {
-    memset((void *)&_[0], 255, sizeof(_Pair<T>) * kNumSlot);
+    memset((void *)&_[0], 255, sizeof(_Pair) * kNumSlot);
   }
 
   Segment(size_t depth) {
-    memset((void *)&_[0], 255, sizeof(_Pair<T>) * kNumSlot);
+    memset((void *)&_[0], 255, sizeof(_Pair) * kNumSlot);
   }
 
   static void New(void **seg, size_t depth) {
     auto seg_ptr = reinterpret_cast<Segment *>(AAllocator::Allocate_without_proc(sizeof(Segment)));
-    memset((void *)&seg_ptr->_[0], 0, sizeof(_Pair<T>) * kNumSlot);
+    memset((void *)&seg_ptr->_[0], 0, sizeof(_Pair) * kNumSlot);
     
     *seg = construct_seg_ptr(seg_ptr, depth);
-  }
-
-  void print_seg() {
-    // printf("local depth:%d\n", local_depth);
-    // printf("pattern:%lx\n", pattern);
-    // printf("lock:%d\n", seg_lock);
-    // for (int i = 0; i < kNumSlot; ++i) {
-    //   size_t key_hash = h_key_bits(&_[i].key, 8);
-    //   printf("key:%lu,hash:%lx,pattern:%lx\n", _[i].key, key_hash,
-    //          key_hash >> (8 * sizeof(key_hash) - local_depth));
-    // }
   }
 
   ~Segment(void) {}
@@ -276,7 +184,8 @@ struct Segment {
   int Insert(T, Value_t, size_t, size_t, int, void**, Seg_array<T>*);
   int Update(T, Value_t, size_t, size_t, int, void**, Seg_array<T>*, int, bool);
   int Uniqueness_check(T, size_t loc);
-  int Insert4split(T, Value_t, size_t);
+  int Uniqueness_check_from_candidate(T key, int candidateNum, int *candidateSlotIdx);
+  int Insert4split(Key_t, Value_t, size_t);
   bool Put(T, Value_t, size_t);
   void Rebalance();
 
@@ -323,17 +232,18 @@ struct Segment {
     // mutex.unlock_shared();
   }
 
-  // bool try_get_lock() {
-  //   uint64_t temp = 0;
-  //   return CAS(&seg_lock, &temp, 1);
-  //   // return CAS(&sema, &temp, -1);
-  // }
+  bool try_get_lock() {
+    uint64_t temp = 0;
+    return CAS(&seg_lock, &temp, 1);
+    // return CAS(&sema, &temp, -1);
+  }
 
   bool try_get_rd_lock() {
     // return mutex.try_lock_shared();
     return true;
   }
-  _Pair<T> _[kNumSlot];
+
+  _Pair _[kNumSlot];
 };
 
 template <class T>
@@ -483,9 +393,12 @@ class ZHASH : public Hash<T> {
   ZHASH(void);
   ZHASH(int);
   ~ZHASH(void);
-  int Insert(T key, Value_t value);
-  bool Delete(T);
-  bool Get(T, Value_t *);
+  int Insert(T key, Value_t value, int batch_offset = -1, T *batch_array = nullptr, nsTimer *clks = nullptr);
+  bool Delete(T, int batch_offset = -1, T *batch_array = nullptr, nsTimer *clks = nullptr);
+  bool Get(T, Value_t *, int batch_offset = -1, T *batch_array = nullptr, nsTimer *clks = nullptr);
+  void *GetBucketAddr(T key, Segment<T> **batch_segment_array = nullptr);
+  unsigned GetCandidateSlots(T key, Segment<T> *dir_, Key_t *candidateKeys, Value_t *candidateValues, int *candidateSlotIdx = nullptr);
+  Value_t FindAnyway(T);
   double Utilization(void);
   size_t Capacity(void);
   void Recovery(void);
@@ -508,6 +421,7 @@ class ZHASH : public Hash<T> {
   }
 
   bool Hot_check(T);
+  bool Hot_check_without_update(T);
   bool Hot_update(T);
   void setHot();
   void printHot();
@@ -520,21 +434,45 @@ class ZHASH : public Hash<T> {
 template <class T>
 int Segment<T>::Uniqueness_check(T key, size_t loc)
 {
+  uint64_t key_hash;
+  if constexpr (std::is_pointer_v<T>) {
+    key_hash = h(key->key, key->length);
+  } else {
+    key_hash = h(&key, sizeof(key));
+  }
+
   for (unsigned i = 0; i < kNumSlotPerBucket; i++) {
     unsigned slot = loc * kNumSlotPerBucket + i;
-    if (match_key(_[slot].key, key)) {
+    if (match_key(_[slot].key, key, key_hash)) {
       return slot;
     }
   }
-  // if not found, check the fingerprints in this bucket
-  uint64_t key_hash = h_key_bits(&key, sizeof(key));
+  // if not found, check the overflow fingerprints in this bucket
   for (unsigned i = 0; i < kNumSlotPerBucket; i++) {
     unsigned slot = loc * kNumSlotPerBucket + i;
-    if (match_fingerprint(_[slot].key, key_hash)) {
-      unsigned pos = get_position(_[slot].key);
-      if (match_key(_[pos].key, key)) {
+    if (match_pointer_of_fp((uint64_t)_[slot].value, key_hash)) {
+      unsigned pos = get_pointer_of_pos((uint64_t)_[slot].value);
+      if (match_key(_[pos].key, key, key_hash)) {
         return pos;
       }
+    }
+  }
+  return -1;
+}
+
+template <class T>
+int Segment<T>::Uniqueness_check_from_candidate(T key, int candidateNum, int *candidateSlotIdx)
+{
+  uint64_t key_hash;
+  if constexpr (std::is_pointer_v<T>) {
+    key_hash = h(key->key, key->length);
+  } else {
+    key_hash = h(&key, sizeof(key));
+  }
+
+  for (unsigned i = 0; i < candidateNum; i++) {
+    if (match_key(_[candidateSlotIdx[i]].key, key, key_hash)) {
+      return candidateSlotIdx[i];
     }
   }
   return -1;
@@ -587,7 +525,7 @@ int Segment<T>::Update(T key, Value_t value, size_t loc, size_t key_hash,
     }
 
     // in-place update
-    uint64_t *value_addr = (uint64_t *)(_[slot].value);
+    uint64_t *value_addr = (uint64_t *)get_pointer_addr((uint64_t)_[slot].value);
     for (int i = 0; i < value_length / sizeof(uint64_t); i++) {
       value_addr[i] = uint64_t(value);
     }
@@ -607,10 +545,6 @@ int Segment<T>::Update(T key, Value_t value, size_t loc, size_t key_hash,
       AAllocator::Persist_flush(value_addr, value_length);
   } else if (type == 3 || type == 0) {
     if (type == 3) {
-      // uint64_t old_number = *((uint64_t *)_[slot].value);
-      // Value_t new_value = reinterpret_cast<Value_t>(old_number + 1);
-      // value = AAllocator::Prepare_value(new_value, value_length);
-
       value = AAllocator::Prepare_value(value, value_length);
     }
 
@@ -632,7 +566,7 @@ RE_UPDATE:
     }
 
     /* Critical Section Start */
-    _[slot].value = value;
+    set_pointer_len_addr((uint64_t *)&(_[slot].value), value_length, (uint64_t)value);
     /* Critical Section End */
 
     if (status != _XBEGIN_STARTED)
@@ -648,11 +582,12 @@ template <class T>
 int Segment<T>::Insert(T key, Value_t value, size_t loc, size_t key_hash,
                        int prev_depth, void** seg_pp, Seg_array<T>*sa) {
   int ret = 1;
-
+  char *key_addr;
 #ifdef VALUE_LENGTH_VARIABLE
   value = AAllocator::Prepare_value(value, value_length);
+  if constexpr (std::is_pointer_v<T>)
+    key_addr = AAllocator::Prepare_key(key);
 #endif
-
 #ifdef INSERT_HTM
   int status;
   size_t locking_chunk_size = 0;
@@ -691,12 +626,12 @@ int Segment<T>::Insert(T key, Value_t value, size_t loc, size_t key_hash,
     unsigned slot = (loc * kNumSlotPerBucket + i) % kNumSlot;
     if (i < kNumSlotPerBucket) { // original bucket
       if (!check_key_valid(_[slot].key)) {
-        _[slot].value = value;
-        set_key((void **)&(_[slot].key), key);
+        set_pointer_len_addr((uint64_t *)&(_[slot].value), value_length, (uint64_t)value);
+        set_key(&(_[slot].key), key, key_hash, key_addr);
         ret = 0;
         break;
       } else {
-        if (empty_fp_index == -1 && !check_fingerprint_and_position_valid(_[slot].key)) {
+        if (empty_fp_index == -1 && !check_pointer_of_valid((uint64_t)_[slot].value)) {
           empty_fp_index = slot;
         }
       }
@@ -705,9 +640,9 @@ int Segment<T>::Insert(T key, Value_t value, size_t loc, size_t key_hash,
         break;
       if (!check_key_valid(_[slot].key)) {
         outing_index = slot;
-        _[slot].value = value;
-        set_key((void **)&(_[slot].key), key);
-        set_fingerprint_and_position((void **)&(_[empty_fp_index].key), key_hash, slot);
+        set_pointer_len_addr((uint64_t *)&(_[slot].value), value_length, (uint64_t)value);
+        set_key(&(_[slot].key), key, key_hash, key_addr);
+        set_pointer_of_fp_pos((uint64_t *)&(_[empty_fp_index].value), key_hash, slot);
         ret = 0;
         break;
       }
@@ -731,7 +666,7 @@ int Segment<T>::Insert(T key, Value_t value, size_t loc, size_t key_hash,
 
 template <class T>
 void Segment<T>::Rebalance() {
-  _Pair<T> outing_list[kNumSlot];
+  _Pair outing_list[kNumSlot];
   uint64_t outing_hash[kNumSlot];
   size_t outing_number = 0;
   size_t bucket_number[4] = {0, 0, 0, 0};
@@ -740,12 +675,16 @@ void Segment<T>::Rebalance() {
   for (unsigned i = 0; i < kNumSlot; i++) {
     if (check_key_valid(_[i].key)) {
       uint64_t key_hash;
-      key_hash = h_key_bits(&(_[i].key), sizeof(Key_t));
+      if constexpr (std::is_pointer_v<T>) {
+        key_hash = h((void *)get_pointer_addr(_[i].key), get_pointer_len(_[i].key));
+      } else {
+        key_hash = h(&(_[i].key), sizeof(Key_t));
+      }
       if ((i / kNumBucket) != (key_hash & kMask)) {
         outing_list[outing_number] = _[i];
         outing_hash[outing_number] = key_hash;
         outing_number++;
-        clear_key((void **)&(_[i].key));
+        clear_key(&(_[i].key));
       } else {
         bucket_number[i / kNumBucket]++;
       }
@@ -757,9 +696,8 @@ void Segment<T>::Rebalance() {
     size_t bucket = outing_hash[i] & kMask;
     for (unsigned slot = bucket * kNumSlotPerBucket; slot < (bucket + 1) * kNumSlotPerBucket; slot++) {
       if (!check_key_valid(_[slot].key)) {
-        _[slot].value = outing_list[i].value;
-        set_key((void **)&(_[slot].key), outing_list[i].key);
-        outing_list[i].key = (T)0;
+        _[slot] = outing_list[i]; // value in outing_list is clean without of info
+        outing_list[i].key = INVAL;
         bucket_number[bucket]++;
         break;
       }
@@ -768,7 +706,7 @@ void Segment<T>::Rebalance() {
 
   // second round to set the remaining items to outing buckets
   for (unsigned i = 0; i < outing_number; i++) {
-    if (outing_list[i].key != (T)0) {
+    if (outing_list[i].key != INVAL) {
       size_t bucket = outing_hash[i] & kMask;
       int pos = -1;
       // find the most empty outing bucket
@@ -780,8 +718,7 @@ void Segment<T>::Rebalance() {
       // insert the item in the found bucket
       for (unsigned slot = empty_bucket * kNumSlotPerBucket; slot < (empty_bucket + 1) * kNumSlotPerBucket; slot++) {
         if (!check_key_valid(_[slot].key)) {
-          _[slot].value = outing_list[i].value;
-          set_key((void **)&(_[slot].key), outing_list[i].key);
+          _[slot] = outing_list[i]; // value in outing_list is clean without of info
           bucket_number[empty_bucket]++;
           pos = slot;
           break;
@@ -791,8 +728,8 @@ void Segment<T>::Rebalance() {
       // find and set fingerprint slot in original bucket
       int fin_pos = -1;
       for (unsigned slot = bucket * kNumSlotPerBucket; slot < (bucket + 1) * kNumSlotPerBucket; slot++) {
-        if (!check_fingerprint_and_position_valid(_[slot].key)) {
-          set_fingerprint_and_position((void **)&(_[slot].key), outing_hash[i], pos);
+        if (!check_pointer_of_valid((uint64_t)_[slot].value)) {
+          set_pointer_of_fp_pos((uint64_t *)&(_[slot].value), outing_hash[i], pos);
           fin_pos = slot;
           break;
         }
@@ -803,10 +740,10 @@ void Segment<T>::Rebalance() {
 }
 
 template <class T>
-int Segment<T>::Insert4split(T key, Value_t value, size_t loc) {
+int Segment<T>::Insert4split(Key_t key, Value_t value, size_t loc) {
   // insert into the previous location directly
   _[loc].value = value;
-  set_key((void **)&(_[loc].key), key);
+  _[loc].key = key;
   return 0;
 }
 
@@ -842,6 +779,8 @@ template <class T>
 void ZHASH<T>::Recovery(void) {
   if (dir != nullptr) {
     dir->lock = 0;
+    // dir->new_sa = nullptr;
+
     if (dir->sa == nullptr) return;
     auto dir_entry = dir->sa->_;
     size_t global_depth = dir->sa->global_depth;
@@ -868,13 +807,21 @@ void ZHASH<T>::Recovery(void) {
 template <class T>
 bool ZHASH<T>::Hot_check(T key) {
   size_t key_hash;
-  key_hash = h(&key, sizeof(key));
+  Key_t key_number;
+  if constexpr (std::is_pointer_v<T>) {
+    key_hash = h(key->key, key->length);
+    uint64_t *key_addr = (uint64_t *)key->key;
+    key_number = key_addr[0];
+  } else {
+    key_hash = h(&key, sizeof(key));
+    key_number = key;
+  }
   int idx = key_hash >> (64 - hot_bit);
   uint64_t *hot_arr = dir->hot_arr->_;
 
   idx = idx - (idx % asso);
   for (int i = idx; i < idx + asso; ++i) {
-    if (hot_arr[i] == uint64_t(key))
+    if (hot_arr[i] == key_number)
       return true;
     else if (hot_arr[i] == 0) {
       Hot_update(key);
@@ -885,9 +832,43 @@ bool ZHASH<T>::Hot_check(T key) {
 }
 
 template <class T>
+bool ZHASH<T>::Hot_check_without_update(T key) {
+  size_t key_hash;
+  Key_t key_number;
+  if constexpr (std::is_pointer_v<T>) {
+    key_hash = h(key->key, key->length);
+    uint64_t *key_addr = (uint64_t *)key->key;
+    key_number = key_addr[0];
+  } else {
+    key_hash = h(&key, sizeof(key));
+    key_number = key;
+  }
+  int idx = key_hash >> (64 - hot_bit);
+  uint64_t *hot_arr = dir->hot_arr->_;
+
+  idx = idx - (idx % asso);
+  for (int i = idx; i < idx + asso; ++i) {
+    if (hot_arr[i] == key_number)
+      return true;
+    else if (hot_arr[i] == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+template <class T>
 bool ZHASH<T>::Hot_update(T key) {
   size_t key_hash;
-  key_hash = h(&key, sizeof(key));
+  Key_t key_number;
+  if constexpr (std::is_pointer_v<T>) {
+    key_hash = h(key->key, key->length);
+    uint64_t *key_addr = (uint64_t *)key->key;
+    key_number = key_addr[0];
+  } else {
+    key_hash = h(&key, sizeof(key));
+    key_number = key;
+  }
   int idx = key_hash >> (64 - hot_bit);
   uint64_t *hot_arr = dir->hot_arr->_;
 
@@ -896,17 +877,17 @@ bool ZHASH<T>::Hot_update(T key) {
 
   for (int i = idx; i < idx + asso; i++) {
     if (hot_arr[i] == 0) {
-      hot_arr[i] = uint64_t(key);
+      hot_arr[i] = key_number;
       flag = true;
       break;
     }
-    if (hot_arr[i] == uint64_t(key)) {
+    if (hot_arr[i] == key_number) {
       flag = true;
       if (i != idx) {
         int status = _xbegin();
         if (status == _XBEGIN_STARTED) {
           hot_arr[i] = hot_arr[i - 1];
-          hot_arr[i - 1] = uint64_t(key);
+          hot_arr[i - 1] = key_number;
           _xend();
         }
       }
@@ -914,7 +895,7 @@ bool ZHASH<T>::Hot_update(T key) {
     }
   }
   if (!flag)
-    hot_arr[idx + asso - 1] = uint64_t(key);
+    hot_arr[idx + asso - 1] = key_number;
 
   return true;
 }
@@ -948,7 +929,6 @@ void ZHASH<T>::setHot() {
   Segment<T> *ss;
   Segment<T> *prev_ss = NULL;
   Segment<T> **dir_entry = (Segment<T> **)dir->sa->_;
-  uint64_t min_key = ~0llu;
 
   uint64_t curr_key;
   uint64_t *hot_arr = dir->hot_arr->_;
@@ -967,7 +947,12 @@ void ZHASH<T>::setHot() {
         continue;
       for (unsigned k = 0; k < Segment<T>::kNumSlot; ++k) {
         if (check_key_valid(ss->_[k].key)) {
-          curr_key = get_key(ss->_[k].key);
+          if constexpr (std::is_pointer_v<T>) {
+            uint64_t *key_addr = (uint64_t *)get_pointer_addr(ss->_[k].key);
+            curr_key = key_addr[0];
+          } else {
+            curr_key = ss->_[k].key;
+          }
           for (int p = i; p < i + asso; ++p) {
             if (curr_key < hot_arr[p]) {
               if (p != i)
@@ -992,9 +977,13 @@ void ZHASH<T>::Swap(void **entry, void **new_seg) {
 template <class T>
 Segment<T> *ZHASH<T>::Split(T key, Segment<T> *target, uint64_t prev_depth,
                            Seg_array<T> *sa, void** target_p, uint64_t x, size_t *target_pattern) {
-  size_t key_hash;
   size_t locking_chunk_size = 0;
-  key_hash = h_key_bits(&key, sizeof(key));
+  size_t key_hash;
+  if constexpr (std::is_pointer_v<T>) {
+    key_hash = h(key->key, key->length);
+  } else {
+    key_hash = h(&key, sizeof(key));
+  }
 
   int prev_global_depth = sa->global_depth;
   if (get_local_depth(*target_p) < prev_global_depth) {
@@ -1027,18 +1016,24 @@ Segment<T> *ZHASH<T>::Split(T key, Segment<T> *target, uint64_t prev_depth,
     size_t new_pattern = (pattern << 1) + 1;
     size_t old_pattern = pattern << 1;
     for (unsigned i = 0; i < Segment<T>::kNumSlot; ++i) {
-      uint64_t key_hash;
-      key_hash = h_key_bits(&(target->_[i].key), sizeof(Key_t));
-      size_t bucket = key_hash & kMask;
+      if (check_key_valid(target->_[i].key)) {
+        uint64_t key_hash;
+        if constexpr (std::is_pointer_v<T>) {
+          key_hash = h((void *)get_pointer_addr(target->_[i].key), get_pointer_len(target->_[i].key));
+        } else {
+          key_hash = h(&(target->_[i].key), sizeof(Key_t));
+        }
+        size_t bucket = key_hash & kMask;
 
-      // clear all the fingerprints because there is a overall modification afterward
-      clear_fingerprint_and_position((void **)&(target->_[i].key));
+        // clear all the overflow info because there is a overall modification afterward
+        // clear_fingerprint_and_position((void **)&(target->_[i].key));
+        clear_pointer_of((uint64_t *)&(target->_[i].value));
 
-      if (check_key_valid(target->_[i].key) &&
-          (key_hash >> (8 * 8 - get_local_depth(*target_p) - 1) == new_pattern)) {
-        // move only clear key without fingerprints
-        split->Insert4split((T)get_key(target->_[i].key), target->_[i].value, i);
-        clear_key((void **)&(target->_[i].key));
+        if (key_hash >> (8 * 8 - get_local_depth(*target_p) - 1) == new_pattern) {
+          // move only clear key without fingerprints
+          split->Insert4split(target->_[i].key, target->_[i].value, i);
+          clear_key(&(target->_[i].key));
+        }
       }
     }
 
@@ -1077,7 +1072,11 @@ template <class T>
 void ZHASH<T>::Help_Doubling(T key, Seg_array<T> *new_sa, Segment<T> *target,
                             uint64_t prev_depth) {
   size_t key_hash;
-  key_hash = h_key_bits(&key, sizeof(key));
+  if constexpr (std::is_pointer_v<T>) {
+    key_hash = h(key->key, key->length);
+  } else {
+    key_hash = h(&key, sizeof(key));
+  }
   auto sa = dir->sa;
   auto x = (key_hash >> (8 * sizeof(key_hash) - sa->global_depth));
   unsigned depth_diff = sa->global_depth - prev_depth;
@@ -1249,15 +1248,48 @@ void ZHASH<T>::Directory_Update(int x, void *s0, void **s1,
 }
 
 template <class T>
-int ZHASH<T>::Insert(T key, Value_t value) {
+int ZHASH<T>::Insert(T key, Value_t value, int batch_offset, T *batch_array, nsTimer *clks) {
+  if (batch_offset == 0) {
+    Segment<T> *batch_segment_array[batch_size];
+
+    // clear candidate slots
+    for (unsigned i = 0; i < batch_size; i++) {
+      candidateNum[i] = -1;
+      batch_segment_array[i] = nullptr;
+    }
+
+    // determine segment addresses + prefetch
+    for (int b_idx = 0; b_idx < batch_size; b_idx++) {
+      if (b_idx == 0 || (!Hot_check_without_update(batch_array[b_idx]))) {
+        void *p = GetBucketAddr(batch_array[b_idx], &batch_segment_array[b_idx]);
+        candidateSegments[b_idx] = (void *)(batch_segment_array[b_idx]);
+        prefetch(p);
+      }
+    }
+
+    // determine candidate slots + prefetch
+    for (int b_idx = 0; b_idx < batch_size; b_idx++) {
+      if (batch_segment_array[b_idx] != nullptr) {
+        candidateNum[b_idx] = GetCandidateSlots(batch_array[b_idx], batch_segment_array[b_idx], candidateKeys[b_idx], candidateValues[b_idx], candidateSlotIdx[b_idx]);
+        // prefetch
+        for (unsigned s_idx = 0; s_idx < candidateNum[b_idx]; s_idx++) {
+          if constexpr (std::is_pointer_v<T>)
+            prefetch((void *)get_pointer_addr(candidateKeys[b_idx][s_idx]));
+          prefetch((void *)get_pointer_addr((uint64_t)candidateValues[b_idx][s_idx]));
+        }
+      }
+    }
+  }
   int flag;
-  int retry_time = 0;
-  int lock_retry = 0;
-  int depth_retry = 0;
+  bool recheck_flag = false;
 
 STARTOVER:
   uint64_t key_hash;
-  key_hash = h_key_bits(&key, sizeof(key));
+  if constexpr (std::is_pointer_v<T>) {
+    key_hash = h(key->key, key->length);
+  } else {
+    key_hash = h(&key, sizeof(key));
+  }
   auto y = key_hash & kMask; // bucket index
 
 RETRY:
@@ -1292,18 +1324,36 @@ RETRY:
     goto RETRY;
   }
 Check:
-  int slot = target->Uniqueness_check(key, y);
+  int slot;
+  if (recheck_flag || !candidateNum || candidateNum[batch_offset] == -1 || candidateSegments[batch_offset] != ((void *)target)) {
+    // if (candidateSegments && candidateSegments[batch_offset] != ((void *)target)) {
+    //   batch_invalid++;
+    // }
+    slot = target->Uniqueness_check(key, y);
+  } else {
+    // batch_valid++;
+    slot = target->Uniqueness_check_from_candidate(key, candidateNum[batch_offset], candidateSlotIdx[batch_offset]);
+  }
+    
+
   if (slot != -1) {
     bool hot = false;
     #ifdef VALUE_LENGTH_VARIABLE
+    if (request % FREQ == 0)
+    {
+      Hot_update(key);
+    }
+    request++;
     hot = Hot_check(key);
     #endif
     ret = target->Update(key, value, y, key_hash, prev_depth, target_p, dir->sa, slot, hot);
   } else {
     ret = target->Insert(key, value, y, key_hash, prev_depth, target_p, dir->sa);
   }
-  if (ret == 4)
+  if (ret == 4) {
+    recheck_flag = true;
     goto Check;
+  }
 
   // Flush the splitted segment
   if (flag) {
@@ -1315,6 +1365,11 @@ Check:
   if (ret == -3) return -1;
   // Split
   if (ret == 1) {
+#ifdef SPLIT_LOCK
+    if (!target->try_get_lock()) {
+      goto RETRY;
+    }
+#endif
     Segment<T> *s;
     size_t target_pattern;
     if (Checklock_Directory()) {
@@ -1350,10 +1405,12 @@ Check:
       s = Split(key, target, prev_depth, dir->sa, target_p, x, &target_pattern);
     }
     if (s == NULL) {
-      retry_time++;
       // The segment has been splitted by other thread
       goto RETRY;
     }
+#ifdef SPLIT_LOCK
+    target->release_lock();
+#endif
     if (target_pattern == (key_hash >> (8 * sizeof(key_hash) - get_local_depth(*target_p))))
       AAllocator::Persist_flush(s, sizeof(Segment<T>));
     else
@@ -1368,9 +1425,13 @@ Check:
 }
 
 template <class T>
-bool ZHASH<T>::Delete(T key) {
+bool ZHASH<T>::Delete(T key, int batch_offset, T *batch_array, nsTimer *clks) {
   uint64_t key_hash;
-  key_hash = h_key_bits(&key, sizeof(key));
+  if constexpr (std::is_pointer_v<T>) {
+    key_hash = h(key->key, key->length);
+  } else {
+    key_hash = h(&key, sizeof(key));
+  }
   auto y = key_hash & kMask;
 
 RETRY:
@@ -1382,56 +1443,155 @@ RETRY:
 
   for (unsigned i = 0; i < kNumSlotPerBucket; i++) {
     unsigned slot = y * kNumSlotPerBucket + i;
-    if constexpr (!std::is_pointer_v<T>) {
-      if (match_key(dir_->_[slot].key, key)) {
-        T old_key = dir_->_[slot].key;
-        T invalid_key = (T)(uint64_t)old_key & ~kKeyMask;
+    // if constexpr (!std::is_pointer_v<T>) {
+      if (match_key(dir_->_[slot].key, key, key_hash)) {
+        Key_t old_key = dir_->_[slot].key;
+        Key_t invalid_key = INVAL;
         __sync_bool_compare_and_swap(&(dir_->_[slot].key), old_key, invalid_key);
-        AAllocator::Persist(&dir_->_[slot], sizeof(_Pair<T>));
+        AAllocator::Persist(&dir_->_[slot], sizeof(_Pair));
         return true;
       }
-    }
+    // }
   }
 
   // can not find target in original slots, check all the fingerprints in original bucket
-  if constexpr (!std::is_pointer_v<T>) {
+  // if constexpr (!std::is_pointer_v<T>) {
     for (unsigned i = 0; i < kNumSlotPerBucket; i++) {
       unsigned slot = y * kNumSlotPerBucket + i;
-      if (match_fingerprint(dir_->_[slot].key, key_hash)) {
-        unsigned target_slot = get_position(dir_->_[slot].key);
-        if (match_key(dir_->_[target_slot].key, key)) {
-          T old_key = dir_->_[target_slot].key;
-          T invalid_key = (T)(uint64_t)old_key & ~kKeyMask;
+      // if (match_fingerprint(dir_->_[slot].key, key_hash)) {
+      if (match_pointer_of_fp((uint64_t)dir_->_[slot].value, key_hash)) {
+        // unsigned target_slot = get_position(dir_->_[slot].key);
+        unsigned target_slot = get_pointer_of_pos((uint64_t)dir_->_[slot].value);
+        if (match_key(dir_->_[target_slot].key, key, key_hash)) {
+          Key_t old_key = dir_->_[target_slot].key;
+          Key_t invalid_key = INVAL;
           __sync_bool_compare_and_swap(&(dir_->_[target_slot].key), old_key, invalid_key);
-          AAllocator::Persist(&dir_->_[slot], sizeof(_Pair<T>));
+          AAllocator::Persist(&dir_->_[slot], sizeof(_Pair));
           return true;
         }
       }
     }
-  }
+  // }
 
   return false;
 }
 
 template <class T>
-bool ZHASH<T>::Get(T key, Value_t *value_) {
+void *ZHASH<T>::GetBucketAddr(T key, Segment<T> **batch_segment_array) {
   uint64_t key_hash;
-  key_hash = h_key_bits(&key, sizeof(key));
+  if constexpr (std::is_pointer_v<T>) {
+    key_hash = h(key->key, key->length);
+  } else {
+    key_hash = h(&key, sizeof(key));
+  }
   auto y = key_hash & kMask;
-RETRY:
   auto old_sa = dir->sa;
   auto x = (key_hash >> (8 * sizeof(key_hash) - old_sa->global_depth));
   auto dir_entry = old_sa->_;
   void* target = dir_entry[x];
   Segment<T> *dir_ = reinterpret_cast<Segment<T> *>(get_seg_addr(target));
+  if (batch_segment_array != nullptr)
+    *batch_segment_array = dir_;
+  return (&(dir_->_[y * kNumSlotPerBucket]));
+}
 
-  if (!dir_->try_get_rd_lock()) {
-    goto RETRY;
+template <class T>
+unsigned ZHASH<T>::GetCandidateSlots(T key, Segment<T> *dir_, Key_t *candidateKeys, Value_t *candidateValues, int *candidateSlotIdx) {
+  uint64_t key_hash;
+  if constexpr (std::is_pointer_v<T>) {
+    key_hash = h(key->key, key->length);
+  } else {
+    key_hash = h(&key, sizeof(key));
+  }
+  auto y = key_hash & kMask;
+
+  unsigned candidate = 0;
+  // in-slot key match
+  for (unsigned i = 0; i < kNumSlotPerBucket; i++) {
+    unsigned slot = y * kNumSlotPerBucket + i;
+    if constexpr (std::is_pointer_v<T>) { 
+      if (match_pointer_fp(dir_->_[slot].key, key_hash)) {
+        candidateKeys[candidate] = dir_->_[slot].key;
+        candidateValues[candidate] = dir_->_[slot].value;
+        if (candidateSlotIdx)
+          candidateSlotIdx[candidate] = slot;
+        candidate++;
+      }
+    } else {
+      if (match_key(dir_->_[slot].key, key, key_hash)) { // find the certain right slot for non-pointer key
+        candidateKeys[candidate] = dir_->_[slot].key;
+        candidateValues[candidate] = dir_->_[slot].value;
+        if (candidateSlotIdx)
+          candidateSlotIdx[candidate] = slot;
+        candidate++;
+      }
+    }
   }
 
-#ifdef READ_HTM
+  // overflow key match
+  for (unsigned i = 0; i < kNumSlotPerBucket; i++) {
+    unsigned slot = y * kNumSlotPerBucket + i;
+    if (match_pointer_of_fp((uint64_t)dir_->_[slot].value, key_hash)) {
+      unsigned target_slot = get_pointer_of_pos((uint64_t)dir_->_[slot].value);
+      if constexpr (std::is_pointer_v<T>) { 
+        if (match_pointer_fp(dir_->_[target_slot].key, key_hash)) { // still need to check fp in overflow bucket
+          candidateKeys[candidate] = dir_->_[target_slot].key;
+          candidateValues[candidate] = dir_->_[target_slot].value;
+          if (candidateSlotIdx)
+            candidateSlotIdx[candidate] = target_slot;
+          candidate++;
+        }
+      } else {
+        if (match_key(dir_->_[target_slot].key, key, key_hash)) { // find the certain right slot for non-pointer key
+          candidateKeys[candidate] = dir_->_[target_slot].key;
+          candidateValues[candidate] = dir_->_[target_slot].value;
+          if (candidateSlotIdx)
+            candidateSlotIdx[candidate] = target_slot;
+          candidate++;
+        }
+      }
+    }
+  }
+
+  return candidate;
+}
+
+template <class T>
+bool ZHASH<T>::Get(T key, Value_t *value_, int batch_offset, T *batch_array, nsTimer *clks) {
+  if (batch_offset == 0) {
+    // determine segment addresses + prefetch
+    Segment<T> *batch_segment_array[batch_size];
+    for (int b_idx = 0; b_idx < batch_size; b_idx++) {
+      void *p = GetBucketAddr(batch_array[b_idx], &batch_segment_array[b_idx]);
+      prefetch(p);
+    }
+
+    // determine candidate slots + prefetch
+    for (int b_idx = 0; b_idx < batch_size; b_idx++) {
+      // Key_t candidateKeys[8];
+      // Value_t candidateValues[8];
+      candidateNum[b_idx] = GetCandidateSlots(batch_array[b_idx], batch_segment_array[b_idx], candidateKeys[b_idx], candidateValues[b_idx]);
+      // prefetch
+      for (unsigned s_idx = 0; s_idx < candidateNum[b_idx]; s_idx++) {
+        if constexpr (std::is_pointer_v<T>)
+          prefetch((void *)get_pointer_addr(candidateKeys[b_idx][s_idx]));
+        prefetch((void *)get_pointer_addr((uint64_t)candidateValues[b_idx][s_idx]));
+      }
+    }
+  }
+
+  // start real request process
+  Segment<T> *dir_;
+  // Key_t candidateKeys[8];
+  // Value_t candidateValues[8];
+  GetBucketAddr(key, &dir_);
+  // unsigned candidateNum = GetCandidateSlots(key, dir_, candidateKeys, candidateValues);
+  if (candidateNum[batch_offset] == -1)
+    candidateNum[batch_offset] = GetCandidateSlots(key, dir_, candidateKeys[batch_offset], candidateValues[batch_offset]);
+
+  // start to check candidateNum in HTM
+  #ifdef READ_HTM
   int status;
-  size_t locking_chunk_size = 0;
   for (int htm_retry = 0; htm_retry < READ_RETRY_TIME; ++htm_retry) {
     status = _xbegin();
     if (status == _XBEGIN_STARTED)
@@ -1440,13 +1600,27 @@ RETRY:
   if (status != _XBEGIN_STARTED) {
     return false;
   }
-#endif
+  #endif
 
-  for (unsigned i = 0; i < kNumSlotPerBucket; i++) {
-    unsigned slot = y * kNumSlotPerBucket + i;
-    if (match_key(dir_->_[slot].key, key)) {
-      auto value = dir_->_[slot].value;
-      dir_->release_rd_lock();
+  for (unsigned i = 0; i < candidateNum[batch_offset]; i++) {
+    if constexpr (std::is_pointer_v<T>) {
+      if (var_compare((char *)get_pointer_addr(candidateKeys[batch_offset][i]), (char *)&(key->key), 
+                      get_pointer_len(candidateKeys[batch_offset][i]), key->length)) {
+        Value_t value = (Value_t)get_pointer_addr((uint64_t)candidateValues[batch_offset][i]);
+        #ifdef VALUE_LENGTH_VARIABLE
+        memcpy(value_, value, value_length);
+        #else
+        *value_ = value;
+        #endif
+        #ifdef READ_HTM
+        if (status == _XBEGIN_STARTED)
+          _xend();
+        #endif
+        return true;
+      }
+    } else {
+      assert(candidateNum[batch_offset] <= 1);
+      Value_t value = (Value_t)get_pointer_addr((uint64_t)candidateValues[batch_offset][i]);
       #ifdef VALUE_LENGTH_VARIABLE
       memcpy(value_, value, value_length);
       #else
@@ -1459,36 +1633,10 @@ RETRY:
       return true;
     }
   }
-
-  // can not find target in original slots, check all the fingerprints in original bucket
-  if constexpr (!std::is_pointer_v<T>) {
-    for (unsigned i = 0; i < kNumSlotPerBucket; i++) {
-      unsigned slot = y * kNumSlotPerBucket + i;
-      if (match_fingerprint(dir_->_[slot].key, key_hash)) {
-        unsigned target_slot = get_position(dir_->_[slot].key);
-        if (match_key(dir_->_[target_slot].key, key)) {
-          auto value = dir_->_[target_slot].value;
-          dir_->release_rd_lock();
-          #ifdef VALUE_LENGTH_VARIABLE
-          memcpy(value_, value, value_length);
-          #else
-          *value_ = value;
-          #endif
-          #ifdef READ_HTM
-          if (status == _XBEGIN_STARTED)
-            _xend();
-          #endif
-          return true;
-        }
-      }
-    }
-  }
-  
-  dir_->release_rd_lock();
-#ifdef READ_HTM
+  #ifdef READ_HTM
   if (status == _XBEGIN_STARTED)
     _xend();
-#endif
+  #endif
   return false;
 }
 }  // namespace zhash
