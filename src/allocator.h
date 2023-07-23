@@ -118,6 +118,8 @@ public:
         if (!pm_block_lists)
             pm_block_lists = new Region[free_list_number];
     }
+
+    void Store_thread_status(int thread_id) {}
     
     static AAllocator* Get() { return instance_; }
 

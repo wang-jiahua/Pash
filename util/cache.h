@@ -45,3 +45,16 @@ static void clear_cache() {
   delete[] garbage;
 }
 
+inline void prefetch(const void *ptr) {
+    typedef struct {
+        char x[CACHE_ALIGN];
+    } cacheline_t;
+    asm volatile("prefetcht0 %0" : : "m"(*(const cacheline_t *)ptr));
+}
+
+inline void prefetch_more(const void *ptr, int size) {
+    for (int i = 0; i < size / CACHE_ALIGN; i++) {
+        prefetch(ptr + CACHE_ALIGN * i);
+    }
+}
+
