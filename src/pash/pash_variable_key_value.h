@@ -232,11 +232,11 @@ struct Segment {
     // mutex.unlock_shared();
   }
 
-  bool try_get_lock() {
-    uint64_t temp = 0;
-    return CAS(&seg_lock, &temp, 1);
-    // return CAS(&sema, &temp, -1);
-  }
+  // bool try_get_lock() {
+  //   uint64_t temp = 0;
+  //   return CAS(&seg_lock, &temp, 1);
+  //   // return CAS(&sema, &temp, -1);
+  // }
 
   bool try_get_rd_lock() {
     // return mutex.try_lock_shared();
