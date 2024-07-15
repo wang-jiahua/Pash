@@ -4,6 +4,7 @@
 #ifndef _WIN32
 
 #include <unistd.h>
+#include <cstdint>
 
 #define CREATE_MODE_RW (S_IWUSR | S_IRUSR)
 
@@ -16,7 +17,7 @@ static inline int file_exists(char const *file) { return access(file, F_OK); }
  * find_last_set_64 -- returns last set bit position or -1 if set bit not found
  */
 static inline int find_last_set_64(uint64_t val) {
-  return 64 - __builtin_clzll(val) - 1;
+    return 64 - __builtin_clzll(val) - 1;
 }
 
 #else
@@ -36,12 +37,12 @@ static inline int file_exists(char const *file) { return _access(file, 0); }
  * find_last_set_64 -- returns last set bit position or -1 if set bit not found
  */
 static inline int find_last_set_64(uint64_t val) {
-  DWORD lz = 0;
+    DWORD lz = 0;
 
-  if (BitScanReverse64(&lz, val))
-    return (int)lz;
-  else
-    return -1;
+    if (BitScanReverse64(&lz, val))
+        return (int)lz;
+    else
+        return -1;
 }
 
 #endif

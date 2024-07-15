@@ -4,55 +4,54 @@
 
 #pragma once
 
-#include "zipfian_int_distribution.hpp"
 #include "random.h"
+#include "zipfian_int_distribution.hpp"
 
 /*
-* Used to generate different key distribution used in the mini benchmark.
-* Including: (1) uniform random distribution (2) zipfian distribution (3) range distribution (generate the interger one by one in a range specified by the user)
-*/
+ * Used to generate different key distribution used in the mini benchmark.
+ * Including: (1) uniform random distribution (2) zipfian distribution (3) range distribution (generate the interger one by one in a range specified by the user)
+ */
 
-class key_generator_t{
+class key_generator_t {
 public:
- key_generator_t(){
+    key_generator_t() {
+    }
 
- }
-
- virtual uint64_t next_uint64() = 0;
+    virtual uint64_t next_uint64() = 0;
 };
 
-class uniform_key_generator_t : public key_generator_t{
+class uniform_key_generator_t : public key_generator_t {
 public:
-    uniform_key_generator_t(){
-        unsigned long long init[4]={0x12345ULL, 0x23456ULL, 0x34567ULL, 0x45678ULL}, length=4;
+    uniform_key_generator_t() {
+        unsigned long long init[4] = {0x12345ULL, 0x23456ULL, 0x34567ULL, 0x45678ULL}, length = 4;
         init_by_array64(init, length);
     }
 
-    uint64_t next_uint64(){
+    uint64_t next_uint64() {
         return genrand64_int64();
     }
 };
 
-class range_key_generator_t : public key_generator_t{
+class range_key_generator_t : public key_generator_t {
 public:
-    range_key_generator_t(size_t start){
+    range_key_generator_t(size_t start) {
         start_number = start;
     }
 
-    uint64_t next_uint64(){
+    uint64_t next_uint64() {
         return start_number++;
     }
+
 private:
     size_t start_number = 0;
 };
 
-class zipfian_key_generator_t : public key_generator_t{
+class zipfian_key_generator_t : public key_generator_t {
 public:
-    zipfian_key_generator_t(size_t start, size_t end, float skew) : dist_(start, end, skew), generator_(1647417570){
-
+    zipfian_key_generator_t(size_t start, size_t end, float skew) : dist_(start, end, skew), generator_(1647417570) {
     }
 
-    uint64_t next_uint64(){
+    uint64_t next_uint64() {
         return dist_(generator_);
     }
 

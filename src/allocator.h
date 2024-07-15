@@ -1,17 +1,18 @@
 #pragma once
+#include <fcntl.h>
 #include <garbage_list.h>
 #include <sys/mman.h>
+#include <unistd.h>
+
 #include <fstream>
 #include <thread>
-#include <unistd.h>
-#include <fcntl.h>
 
-#include "../util/utils.h"
-#include "../util/pair.h"
 #include "../util/cache.h"
+#include "../util/pair.h"
+#include "../util/utils.h"
 #include "x86intrin.h"
 
-#define eADR
+// #define eADR
 #define PAGE_SIZE 4096
 
 struct Region {
@@ -52,9 +53,9 @@ struct Region {
     }
 };
 
-const static int free_list_number = 8; // from 8byte to 1K
+const static int free_list_number = 8;  // from 8byte to 1K
 const static size_t power_two[free_list_number] = {8, 16, 32, 64, 128, 256, 512, 1024};
-const static size_t mem_pool_size = 1024ul * 1024ul * 1024ul * 10ul;
+const static size_t mem_pool_size = 1024ul * 1024ul * 1024ul * 20ul;
 static Region global_pm_pool;
 static Region global_mem_pool;
 __thread Region* pm_block_lists;
@@ -83,7 +84,7 @@ public:
     static AAllocator* instance_;
 
     AAllocator(const char* pool_name, size_t pool_size, size_t thread_num)
-    : pool_size_(pool_size), thread_num_(thread_num + 1) {
+        : pool_size_(pool_size), thread_num_(thread_num + 1) {
         /* initialize pm pool */
         LOG(pool_name);
         if (!FileExists(pool_name)) {
@@ -120,7 +121,7 @@ public:
     }
 
     void Store_thread_status(int thread_id) {}
-    
+
     static AAllocator* Get() { return instance_; }
 
     static void* GetRoot(size_t size) {
@@ -128,7 +129,7 @@ public:
         return allocate_block_from_region(pm_block_lists[idx], power_two[idx]);
     }
 
-    static void Allocate(void** ptr, uint32_t alignment, size_t size, int (*alloc_constr)(void* ptr, void*arg), void* arg) {
+    static void Allocate(void** ptr, uint32_t alignment, size_t size, int (*alloc_constr)(void* ptr, void* arg), void* arg) {
         size_t idx = get_list_index(size);
         *ptr = (void*)allocate_block_from_region(pm_block_lists[idx], power_two[idx], true);
 
@@ -151,8 +152,8 @@ public:
     }
 
     // directly fetch and add from global mem pool for dram allocation
-    static void DAllocate(void** ptr, uint32_t alignment, size_t size, int (*alloc_constr)(void* ptr, void*arg), void* arg) {
-        char* curr_addr =  __sync_fetch_and_add(&(global_mem_pool.curr_addr_), size + alignment);
+    static void DAllocate(void** ptr, uint32_t alignment, size_t size, int (*alloc_constr)(void* ptr, void* arg), void* arg) {
+        char* curr_addr = __sync_fetch_and_add(&(global_mem_pool.curr_addr_), size + alignment);
         if (curr_addr + size + alignment >= global_mem_pool.end_addr_) {
             LOG_FATAL("[ALLOCATOR] global mem pool has no more space!");
         }
@@ -171,7 +172,7 @@ public:
         for (int i = 0; i < value_size / sizeof(uint64_t); i++) {
             value_addr[i] = value_number;
         }
-        
+
         pm_block_lists[idx].batch_flush();
         return (Value_t)value_addr;
     }
@@ -190,7 +191,7 @@ public:
         size_t key_size = sizeof(string_key) + key->length;
         size_t idx = get_list_index(key->length);
         char* key_addr = (char*)allocate_block_from_region(pm_block_lists[idx], power_two[idx]);
-        
+
         memcpy(key_addr, key, key_size);
 
         pm_block_lists[idx].batch_flush();
@@ -198,19 +199,19 @@ public:
     }
 
     static void Persist(void* ptr, size_t size) {
-    #ifdef eADR
+#ifdef eADR
         mfence();
-    #else
+#else
         flush(ptr, size);
-    #endif
+#endif
     }
 
     static void Persist_flush(void* ptr, size_t size) {
-       flush(ptr, size);
+        flush(ptr, size);
     }
 
     static void Persist_asyn_flush(void* ptr, size_t size) {
-       asyn_flush(ptr, size);
+        asyn_flush(ptr, size);
     }
 
     static void NTWrite64(uint64_t* ptr, uint64_t val) {
@@ -221,9 +222,13 @@ public:
         _mm_stream_si32((int*)ptr, val);
     }
 
+    static uint64_t total_pm_alloc() {
+        return global_pm_pool.curr_addr_ - global_pm_pool.start_addr_;
+    }
+
 private:
     static void fetch_page_from_center(Region& block_list, size_t page_size = PAGE_SIZE) {
-        char* curr_addr =  __sync_fetch_and_add(&(global_pm_pool.curr_addr_), page_size);
+        char* curr_addr = __sync_fetch_and_add(&(global_pm_pool.curr_addr_), page_size);
         if (curr_addr + page_size >= global_pm_pool.end_addr_) {
             LOG_FATAL("[ALLOCATOR] global pm pool has no more space!");
         }
